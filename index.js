@@ -1,8 +1,14 @@
 require("dotenv").config();
-const {
-  Client,
-  GatewayIntentBits,
-  Partials,
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Channel],
+});
+
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
