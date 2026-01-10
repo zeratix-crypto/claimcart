@@ -67,11 +67,10 @@ const markProcessed = db.prepare(
 // CONFIG (Railway Variables)
 // ======================
 const CONFIG = {
-  dropsChannelId: process.env.DROPS_CHANNEL_ID, // #cart
-  ticketsCategoryId: process.env.TICKETS_CATEGORY_ID, // catégorie tickets-claim
+  dropsChannelId: process.env.DROPS_CHANNEL_ID, // salon #cart
+  ticketsCategoryId: process.env.TICKETS_CATEGORY_ID, // catégorie tickets
   staffRoleName: process.env.STAFF_ROLE_NAME || "RUN",
-  webhookInChannelId: process.env.WEBHOOK_IN_CHANNEL_ID, // #webhook-in
-  allowedSourceBotName: process.env.ALLOWED_SOURCE_BOT_NAME || "VETRO",
+  webhookInChannelId: process.env.WEBHOOK_IN_CHANNEL_ID, // salon #webhook-in
   ticketPrefix: "claim",
 };
 
@@ -85,39 +84,71 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
-  // IMPORTANT: Partials.Message pour que messageUpdate puisse fetch correctement
   partials: [Partials.Channel, Partials.Message],
 });
 
 // ======================
-// Helpers VETRO
+// Helpers VETRO (robustes, sans toucher VETRO)
 // ======================
-function pickField(embed, fieldName) {
+function normalize(str) {
+  return String(str || "").toLowerCase().trim();
+}
+
+function extractUrlFromText(text) {
+  if (!text) return null;
+  const t = String(text);
+
+  const md = t.match(/\((https?:\/\/[^)]+)\)/i);
+  if (md?.[1]) return md[1];
+
+  const angle = t.match(/<\s*(https?:\/\/[^>\s]+)\s*>/i);
+  if (angle?.[1]) return angle[1];
+
+  const raw = t.match(/https?:\/\/\S+/i);
+  return raw?.[0] ? raw[0].replace(/[)>.,!?]+$/g, "") : null;
+}
+
+function pickFieldLoose(embed, keywords) {
   if (!embed?.fields) return null;
-  const f = embed.fields.find(
-    (x) => (x.name || "").toLowerCase() === fieldName.toLowerCase()
-  );
-  return f?.value ?? null;
+  const keys = keywords.map(k => normalize(k));
+
+  for (const f of embed.fields) {
+    const n = normalize(f.name);
+    if (keys.some(k => n.includes(k))) return f.value ?? null;
+  }
+
+  for (const f of embed.fields) {
+    const v = normalize(f.value);
+    if (keys.some(k => v.includes(k))) return f.value ?? null;
+  }
+
+  return null;
 }
 
 function extractCookiesLinkFromVetro(msg) {
   const e = msg.embeds?.[0];
   if (!e) return null;
 
+  // 1) fields "cookies"
   if (Array.isArray(e.fields)) {
     for (const f of e.fields) {
-      const name = (f.name || "").toLowerCase();
+      const name = normalize(f.name);
       const value = String(f.value || "");
 
-      // champ "Cookies link"
-      if (name.includes("cookies") || value.toLowerCase().includes("cookies")) {
-        const md = value.match(/\((https?:\/\/[^)]+)\)/i);
-        if (md?.[1]) return md[1];
-
-        const raw = value.match(/https?:\/\/\S+/i);
-        if (raw?.[0]) return raw[0].replace(/[)>.,!?]+$/g, "");
+      if (name.includes("cookies") || normalize(value).includes("cookies")) {
+        const u = extractUrlFromText(value);
+        if (u) return u;
       }
     }
+  }
+
+  // 2) embed.url
+  if (e.url && normalize(e.url).startsWith("http")) return e.url;
+
+  // 3) description si contient cookies
+  if (e.description && normalize(e.description).includes("cookies")) {
+    const u = extractUrlFromText(e.description);
+    if (u) return u;
   }
 
   return null;
@@ -127,17 +158,17 @@ function prettifyTicket(ticketRaw) {
   if (!ticketRaw) return null;
 
   let t = String(ticketRaw).trim().replace(/\r\n/g, "\n");
-
   t = t
-    .replace(/(\bCat:)/g, "\n$1")
-    .replace(/(\bZone:)/g, "\n$1")
-    .replace(/(\bRow:)/g, "\n$1")
-    .replace(/(\bSeat[s]?:)/g, "\n$1")
+    .replace(/(\bCat:)/gi, "\n$1")
+    .replace(/(\bZone:)/gi, "\n$1")
+    .replace(/(\bRow:)/gi, "\n$1")
+    .replace(/(\bSeat[s]?:)/gi, "\n$1")
+    .replace(/(\bSection:)/gi, "\n$1")
     .trim();
 
   t = t
     .split("\n")
-    .map((x) => x.trim())
+    .map(x => x.trim())
     .filter(Boolean)
     .join("\n");
 
@@ -148,10 +179,11 @@ function buildPublicDropFieldsFromVetro(msg) {
   const e = msg.embeds?.[0];
   if (!e) return { title: "🎁 Nouveau drop", thumbnail: null, fields: [] };
 
-  const event = pickField(e, "Event");
-  const price = pickField(e, "Price");
-  const quantity = pickField(e, "Quantity");
-  const ticket = prettifyTicket(pickField(e, "Ticket"));
+  const event = pickFieldLoose(e, ["event"]);
+  const price = pickFieldLoose(e, ["price", "prix"]);
+  const quantity = pickFieldLoose(e, ["quantity", "qty", "qte", "quantité"]);
+  const ticketRaw = pickFieldLoose(e, ["ticket", "tickets"]);
+  const ticket = prettifyTicket(ticketRaw);
 
   const fields = [];
   if (event) fields.push({ name: "Event", value: String(event), inline: false });
@@ -166,7 +198,7 @@ function buildPublicDropFieldsFromVetro(msg) {
   };
 }
 
-// Critère "prêt": Cookies link + (Event/Price/Quantity/Ticket)
+// prêt dès qu'on a cookies link + au moins 2 infos (souvent Quantity manque)
 function isVetroMessageReady(msg) {
   const e = msg.embeds?.[0];
   if (!e) return false;
@@ -174,12 +206,8 @@ function isVetroMessageReady(msg) {
   const cookies = extractCookiesLinkFromVetro(msg);
   if (!cookies) return false;
 
-  const event = pickField(e, "Event");
-  const price = pickField(e, "Price");
-  const quantity = pickField(e, "Quantity");
-  const ticket = pickField(e, "Ticket");
-
-  return Boolean(event && price && quantity && ticket);
+  const pub = buildPublicDropFieldsFromVetro(msg);
+  return pub.fields.length >= 2;
 }
 
 // ======================
@@ -370,19 +398,17 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ======================
-// Auto Drop depuis #webhook-in (VETRO)
-// FIX: accepte webhookId + fetch sur messageUpdate
+// Auto Drop (sans toucher VETRO)
 // ======================
+const retryTimers = new Map(); // msgId -> true
+
 async function handleVetroMessage(msg) {
   try {
     if (!CONFIG.webhookInChannelId) return;
     if (msg.channelId !== CONFIG.webhookInChannelId) return;
 
-    // Accepter si c'est un webhook OU si le username correspond à VETRO
-    const isWebhook = Boolean(msg.webhookId);
-    const isAllowedName = (msg.author?.username || "") === CONFIG.allowedSourceBotName;
-    if (!isWebhook && !isAllowedName) return;
-
+    // On se base sur un critère solide: embed contient cookies link
+    // (webhook ou pas, on s'en fout)
     const sourceId = msg.id;
 
     const src = getSource.get(sourceId);
@@ -390,7 +416,6 @@ async function handleVetroMessage(msg) {
 
     if (!src) upsertSource.run(sourceId, 0, Date.now());
 
-    // Attend que l'embed soit complet
     if (!isVetroMessageReady(msg)) return;
 
     const cookiesLink = extractCookiesLinkFromVetro(msg);
@@ -426,22 +451,25 @@ async function handleVetroMessage(msg) {
 client.on("messageCreate", async (msg) => {
   await handleVetroMessage(msg);
 
-  // re-test 1s (au cas où l'embed arrive après)
-  setTimeout(async () => {
-    try {
-      const fresh = await msg.channel.messages.fetch(msg.id).catch(() => null);
-      if (fresh) await handleVetroMessage(fresh);
-    } catch {}
-  }, 1000);
+  if (!retryTimers.has(msg.id)) {
+    retryTimers.set(msg.id, true);
+
+    const delays = [1500, 4000, 8000];
+    for (const d of delays) {
+      setTimeout(async () => {
+        try {
+          const fresh = await msg.channel.messages.fetch(msg.id).catch(() => null);
+          if (fresh) await handleVetroMessage(fresh);
+        } catch {}
+      }, d);
+    }
+  }
 });
 
 client.on("messageUpdate", async (_oldMsg, newMsg) => {
   try {
-    // IMPORTANT : fetch si partiel (sinon embeds vides)
     if (newMsg.partial) newMsg = await newMsg.fetch();
-  } catch {
-    // si fetch impossible, on tente quand même
-  }
+  } catch {}
   await handleVetroMessage(newMsg);
 });
 
