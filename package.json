@@ -1,0 +1,14 @@
+{
+  "name": "claim-ticket-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "discord.js": "^14.17.0",
+    "dotenv": "^16.4.5"
+  }
+}
