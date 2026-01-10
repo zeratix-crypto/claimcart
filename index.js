@@ -1,14 +1,9 @@
 require("dotenv").config();
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-  partials: [Partials.Channel],
-});
 
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -16,6 +11,7 @@ const client = new Client({
   ChannelType,
   PermissionsBitField,
 } = require("discord.js");
+
 
 const Database = require("better-sqlite3");
 const db = new Database("claimbot.sqlite");
