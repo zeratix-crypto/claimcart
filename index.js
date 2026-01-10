@@ -45,8 +45,10 @@ const CONFIG = {
   dropsChannelId: process.env.DROPS_CHANNEL_ID,
   ticketsCategoryId: process.env.TICKETS_CATEGORY_ID,
   staffRoleName: process.env.STAFF_ROLE_NAME || "RUN",
+  webhookInChannelId: process.env.WEBHOOK_IN_CHANNEL_ID,
   ticketPrefix: "claim",
 };
+
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
@@ -215,6 +217,66 @@ client.on("interactionCreate", async (interaction) => {
   } catch (err) {
     console.error(err);
     await interaction.editReply("⚠️ Erreur création ticket (permissions/catégorie).");
+  }
+});
+function extractFirstUrl(text) {
+  if (!text) return null;
+  const match = text.match(/https?:\/\/\S+/i);
+  return match ? match[0].replace(/[)>.,!?]+$/g, "") : null; // nettoie la ponctuation finale
+}
+
+// Quand le webhook poste un message dans le salon d'entrée, on crée un drop automatiquement
+client.on("messageCreate", async (msg) => {
+  try {
+    // Ignore bots (sauf webhooks : msg.webhookId existe)
+    const isWebhook = Boolean(msg.webhookId);
+    if (!isWebhook) return;
+
+    if (!CONFIG.webhookInChannelId) return;
+    if (msg.channelId !== CONFIG.webhookInChannelId) return;
+
+    // 1) Essaie d'extraire un lien du contenu
+    let link = extractFirstUrl(msg.content);
+
+    // 2) Si pas dans le contenu, essaie dans l'embed (souvent le webhook met le lien en description)
+    if (!link && msg.embeds && msg.embeds.length > 0) {
+      const e = msg.embeds[0];
+      link =
+        extractFirstUrl(e.description) ||
+        extractFirstUrl(e.title) ||
+        (e.fields || []).map(f => extractFirstUrl(f.value)).find(Boolean) ||
+        null;
+    }
+
+    if (!link) {
+      // pas de lien => on ignore
+      return;
+    }
+
+    // Crée un drop comme /drop
+    const dropId = `${Date.now()}_webhook`;
+    insertDrop.run(dropId, link, Date.now());
+
+    const dropChannel = await client.channels.fetch(CONFIG.dropsChannelId);
+    if (!dropChannel) return;
+
+    const embed = new EmbedBuilder()
+      .setTitle("🎁 Nouveau drop")
+      .setDescription("Clique **Claim**. Le premier qui clique reçoit le lien dans un **ticket**.")
+      .addFields({ name: "Statut", value: "🟢 Disponible", inline: true });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`claim:${dropId}`).setLabel("Claim").setStyle(ButtonStyle.Success)
+    );
+
+    await dropChannel.send({ embeds: [embed], components: [row] });
+
+    // Optionnel : supprimer le message webhook d'entrée pour éviter les fuites
+    // (ça marche si le bot a la permission Manage Messages dans #webhook-in)
+    try { await msg.delete(); } catch {}
+
+  } catch (err) {
+    console.error("Webhook relay error:", err);
   }
 });
 
