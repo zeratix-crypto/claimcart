@@ -12,10 +12,10 @@ const {
   PermissionsBitField,
 } = require("discord.js");
 
-
 const Database = require("better-sqlite3");
 const db = new Database("claimbot.sqlite");
 
+// ====== DB ======
 db.exec(`
 CREATE TABLE IF NOT EXISTS drops (
   drop_id TEXT PRIMARY KEY,
@@ -31,28 +31,43 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 `);
 
-const insertDrop = db.prepare("INSERT OR REPLACE INTO drops(drop_id, link, created_at) VALUES(?,?,?)");
+const insertDrop = db.prepare(
+  "INSERT OR REPLACE INTO drops(drop_id, link, created_at) VALUES(?,?,?)"
+);
 const getDrop = db.prepare("SELECT * FROM drops WHERE drop_id = ?");
-const tryClaim = db.prepare(`INSERT INTO claims(message_id, drop_id, user_id, claimed_at) VALUES(?,?,?,?)`);
+const tryClaim = db.prepare(
+  `INSERT INTO claims(message_id, drop_id, user_id, claimed_at) VALUES(?,?,?,?)`
+);
 const getClaim = db.prepare("SELECT * FROM claims WHERE message_id = ?");
-const setTicketId = db.prepare("UPDATE claims SET ticket_channel_id = ? WHERE message_id = ?");
+const setTicketId = db.prepare(
+  "UPDATE claims SET ticket_channel_id = ? WHERE message_id = ?"
+);
 
+// ====== CONFIG ======
 const CONFIG = {
   dropsChannelId: process.env.DROPS_CHANNEL_ID,
   ticketsCategoryId: process.env.TICKETS_CATEGORY_ID,
   staffRoleName: process.env.STAFF_ROLE_NAME || "RUN",
-  webhookInChannelId: process.env.WEBHOOK_IN_CHANNEL_ID,
+  webhookInChannelId: process.env.WEBHOOK_IN_CHANNEL_ID, // salon #webhook-in
+  allowedSourceBotName: process.env.ALLOWED_SOURCE_BOT_NAME || "VETRO", // l'app qui poste dans webhook-in
   ticketPrefix: "claim",
 };
 
-
+// ====== CLIENT ======
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,   // nécessaire pour messageCreate
+    GatewayIntentBits.MessageContent,  // nécessaire pour lire le contenu
+  ],
   partials: [Partials.Channel],
 });
 
 function resolveStaffRoleId(guild) {
-  const role = guild.roles.cache.find(r => r.name.toLowerCase() === CONFIG.staffRoleName.toLowerCase());
+  const role = guild.roles.cache.find(
+    (r) => r.name.toLowerCase() === CONFIG.staffRoleName.toLowerCase()
+  );
   if (!role) throw new Error(`Rôle staff "${CONFIG.staffRoleName}" introuvable.`);
   return role.id;
 }
@@ -65,7 +80,9 @@ async function createTicket(guild, user, link) {
 
   const staffRoleId = resolveStaffRoleId(guild);
 
-  const safeName = `${CONFIG.ticketPrefix}-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, "");
+  const safeName = `${CONFIG.ticketPrefix}-${user.username}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "");
   const channelName = `${safeName}-${user.id.slice(-4)}`;
 
   const ticket = await guild.channels.create({
@@ -106,7 +123,9 @@ async function createTicket(guild, user, link) {
 
   const embed = new EmbedBuilder()
     .setTitle("✅ Claim validé")
-    .setDescription(`**Utilisateur :** <@${user.id}>\n**Lien :** ${link}\n\n🔒 Ticket privé (toi + staff).`);
+    .setDescription(
+      `**Utilisateur :** <@${user.id}>\n**Lien :** ${link}\n\n🔒 Ticket privé (toi + staff).`
+    );
 
   await ticket.send({
     content: `<@${user.id}> <@&${staffRoleId}>`,
@@ -116,6 +135,7 @@ async function createTicket(guild, user, link) {
   return ticket;
 }
 
+// ====== Slash command ======
 async function registerCommands() {
   const data = [
     {
@@ -133,6 +153,7 @@ client.once("ready", async () => {
   console.log("✅ Commande /drop prête");
 });
 
+// ====== /drop manual ======
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "drop") return;
@@ -164,6 +185,7 @@ client.on("interactionCreate", async (interaction) => {
   await interaction.channel.send({ embeds: [embed], components: [row] });
 });
 
+// ====== Claim button ======
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
   if (!interaction.customId.startsWith("claim:")) return;
@@ -177,6 +199,7 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  // verrou atomique
   try {
     tryClaim.run(publicMessage.id, dropId, interaction.user.id, Date.now());
   } catch {
@@ -215,42 +238,44 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.editReply("⚠️ Erreur création ticket (permissions/catégorie).");
   }
 });
+
+// ====== Webhook-in (VETRO) -> auto drop ======
 function extractFirstUrl(text) {
   if (!text) return null;
   const match = text.match(/https?:\/\/\S+/i);
-  return match ? match[0].replace(/[)>.,!?]+$/g, "") : null; // nettoie la ponctuation finale
+  return match ? match[0].replace(/[)>.,!?]+$/g, "") : null;
 }
 
-// Quand le webhook poste un message dans le salon d'entrée, on crée un drop automatiquement
 client.on("messageCreate", async (msg) => {
   try {
-    // Ignore bots (sauf webhooks : msg.webhookId existe)
-    const isWebhook = Boolean(msg.webhookId);
-    if (!isWebhook) return;
-
+    // salon only
     if (!CONFIG.webhookInChannelId) return;
     if (msg.channelId !== CONFIG.webhookInChannelId) return;
 
-    // 1) Essaie d'extraire un lien du contenu
+    // ignore notre bot
+    if (msg.author?.id === client.user.id) return;
+
+    // sécurité: n'accepter que le bot source (VETRO)
+    // si VETRO change de nom, mets ALLOWED_SOURCE_BOT_NAME dans Railway
+    if (msg.author?.bot && msg.author.username !== CONFIG.allowedSourceBotName) return;
+
+    // extraire lien du contenu
     let link = extractFirstUrl(msg.content);
 
-    // 2) Si pas dans le contenu, essaie dans l'embed (souvent le webhook met le lien en description)
+    // ou des embeds
     if (!link && msg.embeds && msg.embeds.length > 0) {
       const e = msg.embeds[0];
       link =
         extractFirstUrl(e.description) ||
         extractFirstUrl(e.title) ||
-        (e.fields || []).map(f => extractFirstUrl(f.value)).find(Boolean) ||
+        (e.fields || []).map((f) => extractFirstUrl(f.value)).find(Boolean) ||
         null;
     }
 
-    if (!link) {
-      // pas de lien => on ignore
-      return;
-    }
+    if (!link) return;
 
-    // Crée un drop comme /drop
-    const dropId = `${Date.now()}_webhook`;
+    // Crée un drop automatique
+    const dropId = `${Date.now()}_auto`;
     insertDrop.run(dropId, link, Date.now());
 
     const dropChannel = await client.channels.fetch(CONFIG.dropsChannelId);
@@ -267,12 +292,10 @@ client.on("messageCreate", async (msg) => {
 
     await dropChannel.send({ embeds: [embed], components: [row] });
 
-    // Optionnel : supprimer le message webhook d'entrée pour éviter les fuites
-    // (ça marche si le bot a la permission Manage Messages dans #webhook-in)
+    // optionnel: supprimer le message source (si permissions)
     try { await msg.delete(); } catch {}
-
   } catch (err) {
-    console.error("Webhook relay error:", err);
+    console.error("Auto-drop error:", err);
   }
 });
 
