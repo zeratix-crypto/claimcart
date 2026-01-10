@@ -15,7 +15,9 @@ const {
 const Database = require("better-sqlite3");
 const db = new Database("claimbot.sqlite");
 
-// ====== DB ======
+// ======================
+// DB
+// ======================
 db.exec(`
 CREATE TABLE IF NOT EXISTS drops (
   drop_id TEXT PRIMARY KEY,
@@ -31,9 +33,9 @@ CREATE TABLE IF NOT EXISTS claims (
   claimed_at INTEGER NOT NULL
 );
 
--- Anti doublon: 1 traitement max par message VETRO
-CREATE TABLE IF NOT EXISTS seen_messages (
-  message_id TEXT PRIMARY KEY,
+-- 1 message VETRO (source) -> 1 drop max (peu importe le nombre d'événements Discord)
+CREATE TABLE IF NOT EXISTS source_messages (
+  source_message_id TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
 );
 `);
@@ -43,31 +45,35 @@ const insertDrop = db.prepare(
 );
 const getDrop = db.prepare("SELECT * FROM drops WHERE drop_id = ?");
 const tryClaim = db.prepare(
-  `INSERT INTO claims(message_id, drop_id, user_id, claimed_at) VALUES(?,?,?,?)`
+  "INSERT INTO claims(message_id, drop_id, user_id, claimed_at) VALUES(?,?,?,?)"
 );
 const getClaim = db.prepare("SELECT * FROM claims WHERE message_id = ?");
 const setTicketId = db.prepare(
   "UPDATE claims SET ticket_channel_id = ? WHERE message_id = ?"
 );
 
-const markSeen = db.prepare(
-  "INSERT INTO seen_messages(message_id, created_at) VALUES(?, ?)"
+const isSourceHandled = db.prepare(
+  "SELECT source_message_id FROM source_messages WHERE source_message_id = ?"
 );
-const isSeen = db.prepare(
-  "SELECT message_id FROM seen_messages WHERE message_id = ?"
+const markSourceHandled = db.prepare(
+  "INSERT INTO source_messages(source_message_id, created_at) VALUES(?, ?)"
 );
 
-// ====== CONFIG ======
+// ======================
+// CONFIG (Railway Variables)
+// ======================
 const CONFIG = {
-  dropsChannelId: process.env.DROPS_CHANNEL_ID,
-  ticketsCategoryId: process.env.TICKETS_CATEGORY_ID,
+  dropsChannelId: process.env.DROPS_CHANNEL_ID,         // #cart
+  ticketsCategoryId: process.env.TICKETS_CATEGORY_ID,   // catégorie tickets-claim
   staffRoleName: process.env.STAFF_ROLE_NAME || "RUN",
-  webhookInChannelId: process.env.WEBHOOK_IN_CHANNEL_ID, // salon #webhook-in
-  allowedSourceBotName: process.env.ALLOWED_SOURCE_BOT_NAME || "VETRO", // app/bot autorisé
+  webhookInChannelId: process.env.WEBHOOK_IN_CHANNEL_ID, // #webhook-in
+  allowedSourceBotName: process.env.ALLOWED_SOURCE_BOT_NAME || "VETRO",
   ticketPrefix: "claim",
 };
 
-// ====== CLIENT ======
+// ======================
+// Client
+// ======================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -78,7 +84,66 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// ====== Helpers ======
+// ======================
+// Helpers
+// ======================
+function extractFirstUrl(text) {
+  if (!text) return null;
+  const match = text.match(/https?:\/\/\S+/i);
+  return match ? match[0].replace(/[)>.,!?]+$/g, "") : null;
+}
+
+function pickField(embed, names) {
+  if (!embed?.fields) return null;
+  const lower = names.map((n) => n.toLowerCase());
+  const f = embed.fields.find((x) => lower.includes((x.name || "").toLowerCase()));
+  return f?.value || null;
+}
+
+function buildDropDetailsFromVetro(msg) {
+  const e = msg.embeds?.[0];
+  if (!e) {
+    return {
+      title: "🎁 Nouveau drop",
+      description: "Clique **Claim**. Le premier qui clique reçoit le lien dans un **ticket**.",
+      thumbnail: null,
+      fields: [],
+    };
+  }
+
+  const store = pickField(e, ["Store"]);
+  const event = pickField(e, ["Event"]);
+  const method = pickField(e, ["Method"]);
+  const price = pickField(e, ["Price"]);
+  const mode = pickField(e, ["Mode"]);
+  const ticket = pickField(e, ["Ticket"]);
+  const expiration = pickField(e, ["Reservation expiration", "Reservation", "Expiration"]);
+
+  const fields = [];
+
+  if (store) fields.push({ name: "Store", value: store, inline: true });
+  if (expiration) fields.push({ name: "Expiration", value: expiration, inline: true });
+  if (event) fields.push({ name: "Event", value: event, inline: false });
+
+  const detailsLine = [
+    method && `**Method:** ${method}`,
+    price && `**Price:** ${price}`,
+    mode && `**Mode:** ${mode}`,
+  ]
+    .filter(Boolean)
+    .join(" • ");
+
+  if (detailsLine) fields.push({ name: "Détails", value: detailsLine, inline: false });
+  if (ticket) fields.push({ name: "Ticket", value: ticket, inline: false });
+
+  return {
+    title: e.title || "🎁 Nouveau drop",
+    description: "Clique **Claim**. Le premier qui clique reçoit le lien dans un **ticket**.",
+    thumbnail: e.thumbnail?.url || null,
+    fields,
+  };
+}
+
 function resolveStaffRoleId(guild) {
   const role = guild.roles.cache.find(
     (r) => r.name.toLowerCase() === CONFIG.staffRoleName.toLowerCase()
@@ -150,7 +215,9 @@ async function createTicket(guild, user, link) {
   return ticket;
 }
 
-// ====== Slash command /drop ======
+// ======================
+// Slash Commands
+// ======================
 async function registerCommands() {
   const data = [
     {
@@ -168,7 +235,9 @@ client.once("ready", async () => {
   console.log("✅ Commande /drop prête");
 });
 
-// ====== /drop manual ======
+// ======================
+// /drop (manuel)
+// ======================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "drop") return;
@@ -203,7 +272,9 @@ client.on("interactionCreate", async (interaction) => {
   await interaction.channel.send({ embeds: [embed], components: [row] });
 });
 
-// ====== Claim button ======
+// ======================
+// Bouton Claim
+// ======================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
   if (!interaction.customId.startsWith("claim:")) return;
@@ -217,6 +288,7 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  // verrou atomique (SQLite)
   try {
     tryClaim.run(publicMessage.id, dropId, interaction.user.id, Date.now());
   } catch {
@@ -256,86 +328,31 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ====== Auto drop from VETRO (webhook-in) ======
-function extractFirstUrl(text) {
-  if (!text) return null;
-  const match = text.match(/https?:\/\/\S+/i);
-  return match ? match[0].replace(/[)>.,!?]+$/g, "") : null;
-}
-
-function pickField(embed, names) {
-  if (!embed?.fields) return null;
-  const lower = names.map((n) => n.toLowerCase());
-  const f = embed.fields.find((x) => lower.includes((x.name || "").toLowerCase()));
-  return f?.value || null;
-}
-
-function buildDropDetailsFromVetro(msg) {
-  const e = msg.embeds?.[0];
-  if (!e) {
-    return {
-      title: "🎁 Nouveau drop",
-      description: "Clique **Claim**. Le premier qui clique reçoit le lien dans un **ticket**.",
-      thumbnail: null,
-      fields: [],
-    };
-  }
-
-  const store = pickField(e, ["Store"]);
-  const event = pickField(e, ["Event"]);
-  const method = pickField(e, ["Method"]);
-  const price = pickField(e, ["Price"]);
-  const mode = pickField(e, ["Mode"]);
-  const ticket = pickField(e, ["Ticket"]);
-  const expiration = pickField(e, ["Reservation expiration", "Reservation", "Expiration"]);
-
-  const fields = [];
-
-  if (store) fields.push({ name: "Store", value: store, inline: true });
-  if (expiration) fields.push({ name: "Expiration", value: expiration, inline: true });
-
-  if (event) fields.push({ name: "Event", value: event, inline: false });
-
-  const detailsLine = [
-    method && `**Method:** ${method}`,
-    price && `**Price:** ${price}`,
-    mode && `**Mode:** ${mode}`,
-  ]
-    .filter(Boolean)
-    .join(" • ");
-
-  if (detailsLine) fields.push({ name: "Détails", value: detailsLine, inline: false });
-  if (ticket) fields.push({ name: "Ticket", value: ticket, inline: false });
-
-  return {
-    title: e.title || "🎁 Nouveau drop",
-    description: "Clique **Claim**. Le premier qui clique reçoit le lien dans un **ticket**.",
-    thumbnail: e.thumbnail?.url || null,
-    fields,
-  };
-}
-
+// ======================
+// Auto Drop depuis #webhook-in (VETRO)
+// ======================
 client.on("messageCreate", async (msg) => {
   try {
-    // salon only
+    // uniquement le salon webhook-in
     if (!CONFIG.webhookInChannelId) return;
     if (msg.channelId !== CONFIG.webhookInChannelId) return;
 
     // ignore notre bot
     if (msg.author?.id === client.user.id) return;
 
-    // sécurité: on n'accepte que le bot source (VETRO)
+    // n'accepter que VETRO (ou le bot défini)
     if (msg.author?.bot && msg.author.username !== CONFIG.allowedSourceBotName) return;
 
-    // Anti doublon : 1 fois par message
-    if (isSeen.get(msg.id)) return;
+    // 1 message source -> 1 drop max (pas de suppression, pas de fenêtre temps)
+    const sourceId = msg.id;
+    if (isSourceHandled.get(sourceId)) return;
     try {
-      markSeen.run(msg.id, Date.now());
+      markSourceHandled.run(sourceId, Date.now());
     } catch {
       return;
     }
 
-    // 1 lien max : on prend le premier trouvé
+    // 1 seul lien : le premier trouvé
     let link = extractFirstUrl(msg.content);
 
     // sinon on cherche dans les embeds
@@ -373,7 +390,7 @@ client.on("messageCreate", async (msg) => {
 
     await dropChannel.send({ embeds: [embed], components: [row] });
 
-    // On NE supprime PLUS le message VETRO.
+    // IMPORTANT: on ne supprime pas le message VETRO.
   } catch (err) {
     console.error("Auto-drop error:", err);
   }
