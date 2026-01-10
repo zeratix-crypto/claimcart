@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS claims (
   claimed_at INTEGER NOT NULL
 );
 
--- 1 message VETRO (source) -> 1 drop max (traité seulement quand l'embed est "complet")
 CREATE TABLE IF NOT EXISTS source_messages (
   source_message_id TEXT PRIMARY KEY,
   processed INTEGER NOT NULL DEFAULT 0,
@@ -86,7 +85,8 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel],
+  // IMPORTANT: Partials.Message pour que messageUpdate puisse fetch correctement
+  partials: [Partials.Channel, Partials.Message],
 });
 
 // ======================
@@ -100,10 +100,6 @@ function pickField(embed, fieldName) {
   return f?.value ?? null;
 }
 
-/**
- * Retourne UNIQUEMENT le lien "Cookies link" depuis l'embed VETRO.
- * (Ce lien ne sera jamais affiché publiquement)
- */
 function extractCookiesLinkFromVetro(msg) {
   const e = msg.embeds?.[0];
   if (!e) return null;
@@ -113,45 +109,25 @@ function extractCookiesLinkFromVetro(msg) {
       const name = (f.name || "").toLowerCase();
       const value = String(f.value || "");
 
+      // champ "Cookies link"
       if (name.includes("cookies") || value.toLowerCase().includes("cookies")) {
-        // markdown: [texte](url)
         const md = value.match(/\((https?:\/\/[^)]+)\)/i);
         if (md?.[1]) return md[1];
 
-        // lien brut
         const raw = value.match(/https?:\/\/\S+/i);
         if (raw?.[0]) return raw[0].replace(/[)>.,!?]+$/g, "");
       }
     }
   }
 
-  // fallback rare (si le bot place "cookies" dans description)
-  const desc = e.description ? String(e.description) : "";
-  if (desc.toLowerCase().includes("cookies")) {
-    const md = desc.match(/\((https?:\/\/[^)]+)\)/i);
-    if (md?.[1]) return md[1];
-    const raw = desc.match(/https?:\/\/\S+/i);
-    if (raw?.[0]) return raw[0].replace(/[)>.,!?]+$/g, "");
-  }
-
   return null;
 }
 
-/**
- * Met en forme le champ Ticket pour que ce soit lisible (Cat/Zone/Row/Seats...)
- * Exemple VETRO:
- * "Cat: ... Row: ...\nSeats: 2"
- */
 function prettifyTicket(ticketRaw) {
   if (!ticketRaw) return null;
 
-  let t = String(ticketRaw).trim();
+  let t = String(ticketRaw).trim().replace(/\r\n/g, "\n");
 
-  // normalise les séparateurs
-  t = t.replace(/\r\n/g, "\n");
-
-  // Si tout est sur une ligne, on essaie de découper
-  // Cat: ... Zone: ... Row: ... Seats: ...
   t = t
     .replace(/(\bCat:)/g, "\n$1")
     .replace(/(\bZone:)/g, "\n$1")
@@ -159,7 +135,6 @@ function prettifyTicket(ticketRaw) {
     .replace(/(\bSeat[s]?:)/g, "\n$1")
     .trim();
 
-  // enlève éventuelles lignes vides
   t = t
     .split("\n")
     .map((x) => x.trim())
@@ -169,10 +144,6 @@ function prettifyTicket(ticketRaw) {
   return t;
 }
 
-/**
- * Construit les infos PUBLIQUES (sans lien) pour décider de claim.
- * On affiche UNIQUEMENT : Event, Price, Quantity, Ticket (avec Seats lisibles)
- */
 function buildPublicDropFieldsFromVetro(msg) {
   const e = msg.embeds?.[0];
   if (!e) return { title: "🎁 Nouveau drop", thumbnail: null, fields: [] };
@@ -195,16 +166,13 @@ function buildPublicDropFieldsFromVetro(msg) {
   };
 }
 
-/**
- * Critère "embed complet"
- * -> on exige Event + Price + Quantity + Ticket + Cookies link
- */
+// Critère "prêt": Cookies link + (Event/Price/Quantity/Ticket)
 function isVetroMessageReady(msg) {
   const e = msg.embeds?.[0];
   if (!e) return false;
 
-  const link = extractCookiesLinkFromVetro(msg);
-  if (!link) return false;
+  const cookies = extractCookiesLinkFromVetro(msg);
+  if (!cookies) return false;
 
   const event = pickField(e, "Event");
   const price = pickField(e, "Price");
@@ -309,8 +277,7 @@ client.once("ready", async () => {
 });
 
 // ======================
-// /drop (manuel)
-// (le lien n'est pas public, il part uniquement dans le ticket après claim)
+// /drop (manuel) - pas de lien public
 // ======================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -359,7 +326,6 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  // verrou atomique (SQLite)
   try {
     tryClaim.run(publicMessage.id, dropId, interaction.user.id, Date.now());
   } catch {
@@ -405,40 +371,31 @@ client.on("interactionCreate", async (interaction) => {
 
 // ======================
 // Auto Drop depuis #webhook-in (VETRO)
-// - Attend l'embed complet (messageUpdate + retry 1s)
-// - En public: Event / Price / Quantity / Ticket (lisible)
-// - Jamais de lien en public
-// - Dans le ticket: uniquement Cookies link
+// FIX: accepte webhookId + fetch sur messageUpdate
 // ======================
 async function handleVetroMessage(msg) {
   try {
     if (!CONFIG.webhookInChannelId) return;
     if (msg.channelId !== CONFIG.webhookInChannelId) return;
 
-    if (msg.author?.id === client.user.id) return;
-
-    // n'accepter que VETRO (ou le nom défini)
-    if (msg.author?.bot && msg.author.username !== CONFIG.allowedSourceBotName) return;
+    // Accepter si c'est un webhook OU si le username correspond à VETRO
+    const isWebhook = Boolean(msg.webhookId);
+    const isAllowedName = (msg.author?.username || "") === CONFIG.allowedSourceBotName;
+    if (!isWebhook && !isAllowedName) return;
 
     const sourceId = msg.id;
 
-    // déjà traité ?
     const src = getSource.get(sourceId);
     if (src?.processed === 1) return;
 
-    // enregistre existence (processed=0) si pas déjà présent
-    if (!src) {
-      upsertSource.run(sourceId, 0, Date.now());
-    }
+    if (!src) upsertSource.run(sourceId, 0, Date.now());
 
-    // attendre embed complet
+    // Attend que l'embed soit complet
     if (!isVetroMessageReady(msg)) return;
 
-    // link = Cookies link (et seulement celui-là)
     const cookiesLink = extractCookiesLinkFromVetro(msg);
     if (!cookiesLink) return;
 
-    // infos publiques (sans lien)
     const pub = buildPublicDropFieldsFromVetro(msg);
 
     const dropId = `${Date.now()}_auto`;
@@ -460,19 +417,16 @@ async function handleVetroMessage(msg) {
     );
 
     await dropChannel.send({ embeds: [embed], components: [row] });
-
-    // seulement maintenant on marque traité
     markProcessed.run(sourceId);
   } catch (err) {
     console.error("handleVetroMessage error:", err);
   }
 }
 
-// messageCreate: premier passage
 client.on("messageCreate", async (msg) => {
   await handleVetroMessage(msg);
 
-  // retry 1s : au cas où l'update n'arrive pas mais l'embed se remplit
+  // re-test 1s (au cas où l'embed arrive après)
   setTimeout(async () => {
     try {
       const fresh = await msg.channel.messages.fetch(msg.id).catch(() => null);
@@ -481,8 +435,13 @@ client.on("messageCreate", async (msg) => {
   }, 1000);
 });
 
-// messageUpdate: quand VETRO enrichit l'embed
 client.on("messageUpdate", async (_oldMsg, newMsg) => {
+  try {
+    // IMPORTANT : fetch si partiel (sinon embeds vides)
+    if (newMsg.partial) newMsg = await newMsg.fetch();
+  } catch {
+    // si fetch impossible, on tente quand même
+  }
   await handleVetroMessage(newMsg);
 });
 
