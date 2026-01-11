@@ -327,7 +327,7 @@ client.on("interactionCreate", async (interaction) => {
 
   const embed = new EmbedBuilder()
     .setTitle("🎁 Nouveau drop")
-    .setDescription("Clique **Claim**. Le premier qui clique reçoit le lien dans un **ticket**.")
+    .setDescription("Clique **Claim**. Le premier qui clique reçoit le lien dans un **ticket** Clique seulement si tu a l'extension, Si tu clique tu dois payer 10 euro par tickets.")
     .addFields({ name: "Statut", value: "🟢 Disponible", inline: true });
 
   const row = new ActionRowBuilder().addComponents(
